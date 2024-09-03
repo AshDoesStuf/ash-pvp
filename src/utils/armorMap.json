@@ -1,0 +1,29 @@
+{
+  "lether_helmet": "head",
+  "golden_helmet": "head",
+  "chainmail_helmet": "head",
+  "iron_helmet": "head",
+  "diamond_helmet": "head",
+  "netherite_helmet": "head",
+
+  "leather_chestplate": "torso",
+  "golden_chestplate": "torso",
+  "chainmail_chestplate": "torso",
+  "iron_chestplate": "torso",
+  "diamond_chestplate": "torso",
+  "netherite_chestplate": "torso",
+
+  "leather_leggings": "legs",
+  "golden_leggings": "legs",
+  "chainmail_leggings": "legs",
+  "iron_leggings": "legs",
+  "diamond_leggings": "legs",
+  "netherite_leggings": "legs",
+
+  "lether_boots": "feet",
+  "golden_boots": "feet",
+  "chainmail_boots": "feet",
+  "iron_boots": "feet",
+  "diamond_boots": "feet",
+  "netherite_boots": "feet"
+}
