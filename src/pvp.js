@@ -21,9 +21,6 @@ const {
 } = require("./utils/utils.js");
 
 class AshPvP extends EventEmitter {
-  /**
-   * @type {import("mineflayer").Bot}
-   */
   #bot;
 
   #wtapping = false;
@@ -34,6 +31,9 @@ class AshPvP extends EventEmitter {
 
   constructor(bot) {
     super();
+    /**
+     * @type {import("mineflayer").Bot}
+     */
     this.#bot = bot;
 
     this.options = {
@@ -59,6 +59,7 @@ class AshPvP extends EventEmitter {
     this.target = null;
     this.lastAttackTime = 0;
     this.isAttacking = false;
+    this.ffaToggle = false;
 
     this.strafeDuration = 2500;
     this.lastStrafeChangeTime = Date.now();
@@ -71,8 +72,36 @@ class AshPvP extends EventEmitter {
     this.updateTick = this.updateTick.bind(this);
     this.stop = this.stop.bind(this);
 
+    this.teamates = [];
+
+    (async () => {
+      /**
+       * username : Team
+       */
+      const teams = this.#bot.teamMap;
+      const botTeam = teams[bot.username];
+
+      if (!botTeam) return console.log("pluh");
+
+      const teamMember = botTeam.members;
+
+      for (const member of teamMember) {
+        if (member === this.#bot.username) continue;
+
+        this.teamates.push(member);
+      }
+    })();
+
     this.#bot.on("physicsTick", this.updateTick);
     this.#bot.on("death", this.stop);
+    this.#bot.on("entityDead", (entity) => {
+      if (!this.target) return;
+
+      if (this.target.id === entity.id) {
+        this.stop();
+        this.emit("target-death", entity);
+      }
+    });
   }
 
   /**
@@ -87,20 +116,44 @@ class AshPvP extends EventEmitter {
     this.target = target;
   }
 
+  /**
+   * Tell bot to attack anyone in sight
+   */
+  ffa() {
+    this.ffaToggle = !this.ffaToggle;
+  }
+
+  ffaTick() {
+    if (!this.ffaToggle) return;
+
+    if (this.target) return;
+
+    const nearestPlayer = this.#bot.nearestEntity((entity) => {
+      return (
+        entity.type === "player" &&
+        !this.teamates.includes(entity.username) &&
+        !this.#bot.hivemind.kings.includes(entity.username)
+      );
+    });
+
+    if (!nearestPlayer) return;
+
+    this.attack(nearestPlayer);
+  }
+
   attackTick() {
     if (!this.target || this.isAttacking) return;
 
     const currentTime = Date.now();
     const timeSinceLastAttack = currentTime - this.lastAttackTime;
 
+    // Only proceed with an attack if the cooldown has expired
     if (timeSinceLastAttack >= this.heldItemCooldown) {
-      this.lastAttackTime = currentTime;
-      this.isAttacking = true;
-
       const currentPosition = this.#bot.entity.position;
       const targetPosition = this.target.position;
-
       const distance = calculateDistanceInBox(currentPosition, targetPosition);
+
+      // Check if the target is within the correct attack range and the bot is not eating a golden apple
       if (
         between(
           distance,
@@ -109,23 +162,69 @@ class AshPvP extends EventEmitter {
         ) &&
         !this.#eatingGap
       ) {
+        this.isAttacking = true;
+        this.lastAttackTime = currentTime; // Record the attack time
         this.#clostToTarget = true;
-        this.#performAttack();
-      } else this.#clostToTarget = false;
 
-      // After the cooldown, reset the attack flag
+        // Execute a smart attack strategy based on distance to the target
+        if (distance < this.options.minAttackDist + 0.5) {
+          this.#predictiveAttack();
+        } else {
+          this.#performCombo();
+        }
+      } else {
+        this.#clostToTarget = false;
+      }
+
+      // Ensure the bot only resets its attack state after the cooldown has fully passed
       setTimeout(() => {
         this.isAttacking = false;
       }, this.heldItemCooldown);
     }
   }
 
-  #performAttack() {
+  // Predictive attack logic with single attack control
+  #predictiveAttack() {
+    if (this.isAttacking) return; // Avoid multiple attacks on the same tick
+    this.#bot.setControlState("jump", true);
+    setTimeout(() => {
+      this.#bot.setControlState("jump", false);
+      this.#toggleStrafeDirection(); // Switch strafe direction mid-air for unpredictability
+    }, 200);
+
     this.#bot.attack(this.target);
-    this.#wtap();
+    this.#bot.setControlState("sprint", true); // Reset sprint to gain momentum
     this.emit("hit");
   }
 
+  // Combo attack logic with improved timing control
+  #performCombo() {
+    if (this.isAttacking) return; // Ensure no duplicate attacks within the tick
+    this.#bot.setControlState("sprint", true);
+    this.#bot.attack(this.target);
+    this.#bot.setControlState("sprint", false);
+
+    // Execute the second attack in a timed combo sequence
+    setTimeout(() => {
+      this.#bot.attack(this.target);
+      this.#wtap();
+      this.#adaptiveDodge(); // Dodge to avoid retaliation after the combo
+    }, 150);
+
+    this.emit("comboHit");
+  }
+
+  // Adaptive dodge to evade incoming attacks
+  #adaptiveDodge() {
+    const dodgeDirection = Math.random() > 0.5 ? "left" : "right";
+    this.#bot.setControlState(dodgeDirection, true);
+
+    setTimeout(() => {
+      this.#bot.setControlState(dodgeDirection, false);
+    }, 300); // Adjust dodge duration as needed
+  }
+
+  // W-tap technique to reset sprint and increase knockback
   #wtap() {
     this.#wtapping = true;
     this.#bot.setControlState("sprint", false);
@@ -135,7 +234,7 @@ class AshPvP extends EventEmitter {
       this.#bot.setControlState("sprint", true);
       this.#bot.setControlState("forward", true);
       this.#wtapping = false;
-    }, 100);
+    }, 50); // Slight delay to make the W-tap more effective
   }
 
   /**
@@ -143,13 +242,33 @@ class AshPvP extends EventEmitter {
    */
   updateTick() {
     this.heldItemCooldown = this.calculateHeldItemCooldown();
+    this.updateTeamates();
+
     this.lookAtTarget();
     this.attackTick();
+    this.ffaTick();
     this.followTarget();
     this.equip();
     this.updateMainHand();
     this.updateOffhand();
     this.eatGap();
+  }
+
+  updateTeamates() {
+    const teams = this.#bot.teamMap;
+    const botTeam = teams[this.#bot.username];
+
+    if (!botTeam) return;
+
+    const teamMember = botTeam.members;
+
+    for (const member of teamMember) {
+      if (member === this.#bot.username) continue;
+
+      if (this.teamates.includes(member)) continue;
+
+      this.teamates.push(member);
+    }
   }
 
   followTarget() {
@@ -160,9 +279,11 @@ class AshPvP extends EventEmitter {
 
     const distance = calculateDistanceInBox(currentPosition, targetPosition);
 
-    if (distance > this.options.maxFollowRange) return;
+    if (distance > this.options.maxFollowRange) {
+      return;
+    }
 
-    if (distance <= 1.6) {
+    if (distance <= 1.4) {
       this.#bot.setControlState("forward", false);
       return;
     }
@@ -247,7 +368,7 @@ class AshPvP extends EventEmitter {
 
     const yaw = Math.atan2(-dx, -dz);
 
-    this.#bot.look(yaw, 0);
+    this.#bot.look(yaw, 0, true);
   }
 
   calculateHeldItemCooldown() {
@@ -386,6 +507,7 @@ class AshPvP extends EventEmitter {
   }
 
   stop() {
+    this.ffaToggle = false;
     this.target = null;
     this.#bot.clearControlStates();
   }
