@@ -111,7 +111,7 @@ class AshPvP extends EventEmitter {
   attack(target) {
     if (!target) return;
 
-    console.log(target.username);
+    // console.log(target.username);
 
     this.target = target;
   }
@@ -208,7 +208,7 @@ class AshPvP extends EventEmitter {
     setTimeout(() => {
       this.#bot.attack(this.target);
       this.#wtap();
-      this.#adaptiveDodge(); // Dodge to avoid retaliation after the combo
+      this.#adaptiveDodge();
     }, 150);
 
     this.emit("comboHit");
