@@ -19,7 +19,7 @@ function getSpeed(weaponName) {
 }
 
 function getItemEnchantments(item) {
-  if (!item) return []
+  if (!item) return [];
 
   let enchantments = [];
 
@@ -39,9 +39,23 @@ function getItemEnchantments(item) {
   return enchantments;
 }
 
+/**
+ * Generates a random number within a given range, including positive and negative values.
+ * @param {number} min - The minimum value (inclusive).
+ * @param {number} max - The maximum value (inclusive).
+ * @returns {number} A random number between min and max.
+ */
+function getRandomInRange(min, max) {
+  if (min > max) {
+    throw new Error("Min must be less than or equal to max.");
+  }
+  return Math.random() * (max - min) + min;
+}
+
 module.exports = {
   calculateDistanceInBox,
   between,
   getSpeed,
   getItemEnchantments,
+  getRandomInRange,
 };

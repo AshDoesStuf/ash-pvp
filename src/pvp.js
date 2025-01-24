@@ -18,16 +18,24 @@ const {
   getSpeed,
   between,
   getItemEnchantments,
+  getRandomInRange,
 } = require("./utils/utils.js");
 
 class AshPvP extends EventEmitter {
+  /**
+   * @type {import("mineflayer").Bot}
+   */
   #bot;
 
   #wtapping = false;
 
+  #stapping = false;
+
   #clostToTarget = false;
 
   #eatingGap = false;
+
+  #canUpdateMainHand = true;
 
   constructor(bot) {
     super();
@@ -40,7 +48,7 @@ class AshPvP extends EventEmitter {
       /**
        * The minimum attack distance/reach
        */
-      minAttackDist: 0,
+      minAttackDist: 2,
       /**
        * The maximum attack distance/reach
        */
@@ -49,6 +57,10 @@ class AshPvP extends EventEmitter {
        * The max range for following untill we can use pathfinder
        */
       maxFollowRange: 15,
+      /**
+       * The interval at which we switch targets in ffa
+       */
+      targetSwitchInterval: 5000,
     };
 
     /**
@@ -66,6 +78,7 @@ class AshPvP extends EventEmitter {
     this.currentStrafeDirection = "left";
 
     this.lastWTtapTime = 0;
+    this.targetAcquiredAt = 0;
 
     this.heldItemCooldown = this.calculateHeldItemCooldown();
 
@@ -79,6 +92,7 @@ class AshPvP extends EventEmitter {
        * username : Team
        */
       const teams = this.#bot.teamMap;
+      console.log(teams);
       const botTeam = teams[bot.username];
 
       if (!botTeam) return console.log("pluh");
@@ -105,15 +119,36 @@ class AshPvP extends EventEmitter {
   }
 
   /**
-   *
-   * @param {Entity} target The entity you want to attack
+   * Attacks the given target and returns a promise that resolves when the target is dead.
+   * @param {Entity} target - The entity to attack.
+   * @returns {Promise<void>} - Resolves when the target is dead.
    */
   attack(target) {
-    if (!target) return;
-
-    // console.log(target.username);
+    if (!target) {
+      return Promise.reject(new Error("No target specified"));
+    }
 
     this.target = target;
+
+    return new Promise((resolve, reject) => {
+      const onDeath = (entity) => {
+        if (entity.id === target.id) {
+          this.#bot.removeListener("entityDead", onDeath); // Clean up the listener
+          this.stop();
+          resolve(); // Resolve the promise
+        }
+      };
+
+      // If the bot dies or another error occurs, reject the promise
+      const onError = () => {
+        this.#bot.removeListener("entityDead", onDeath); // Clean up the listener
+        this.#bot.removeListener("death", onError); // Clean up the listener
+        reject(new Error("Bot died or an error occurred while attacking"));
+      };
+
+      this.#bot.on("entityDead", onDeath);
+      this.#bot.on("death", onError);
+    });
   }
 
   /**
@@ -123,11 +158,52 @@ class AshPvP extends EventEmitter {
     this.ffaToggle = !this.ffaToggle;
   }
 
-  ffaTick() {
+  /**
+   * @param {Entity[]} mobs
+   */
+  async attackMobGroup(mobs) {
+    // Sort mobs by proximity to the bot
+    mobs.sort(
+      (a, b) =>
+        a.position.distanceTo(this.#bot.entity.position) -
+        b.position.distanceTo(this.#bot.entity.position)
+    );
+
+    // Filter to get mobs within attack range
+    const mobsToAttack = mobs.filter(
+      (mob) => mob.position.distanceTo(this.#bot.entity.position) <= 3
+    );
+
+    // Create an array of promises for attacking the mobs
+    const attackPromises = mobsToAttack.map((mob) => this.attack(mob));
+
+    // Wait for all attacks to complete
+    await Promise.all(attackPromises);
+
+    // Remove attacked mobs from the original array
+    for (const mob of mobsToAttack) {
+      const index = mobs.indexOf(mob);
+      if (index > -1) {
+        mobs.splice(index, 1);
+      }
+    }
+  }
+
+  async ffaTick() {
     if (!this.ffaToggle) return;
 
-    if (this.target) return;
+    // If there's an active target, check if we should switch after some time
+    if (this.target) {
+      const elapsed = Date.now() - this.targetAcquiredAt;
+      if (elapsed < this.options.targetSwitchInterval) {
+        return; // Continue attacking the current target
+      }
 
+      // Reset target after the interval
+      this.target = null;
+    }
+
+    // Find the nearest player who is not a teammate or a king
     const nearestPlayer = this.#bot.nearestEntity((entity) => {
       return (
         entity.type === "player" &&
@@ -138,7 +214,19 @@ class AshPvP extends EventEmitter {
 
     if (!nearestPlayer) return;
 
-    this.attack(nearestPlayer);
+    // Set the new target and track the acquisition time
+    this.target = nearestPlayer;
+    this.targetAcquiredAt = Date.now();
+
+    // Attack the target
+    try {
+      await this.attack(nearestPlayer);
+    } catch (error) {
+      console.log(error);
+    }
+
+    // Optionally clear the target after attacking (if immediate switching is desired)
+    // this.target = null;
   }
 
   attackTick() {
@@ -147,13 +235,12 @@ class AshPvP extends EventEmitter {
     const currentTime = Date.now();
     const timeSinceLastAttack = currentTime - this.lastAttackTime;
 
-    // Only proceed with an attack if the cooldown has expired
+    // Check if attack cooldown has expired
     if (timeSinceLastAttack >= this.heldItemCooldown) {
       const currentPosition = this.#bot.entity.position;
       const targetPosition = this.target.position;
       const distance = calculateDistanceInBox(currentPosition, targetPosition);
 
-      // Check if the target is within the correct attack range and the bot is not eating a golden apple
       if (
         between(
           distance,
@@ -163,53 +250,56 @@ class AshPvP extends EventEmitter {
         !this.#eatingGap
       ) {
         this.isAttacking = true;
-        this.lastAttackTime = currentTime; // Record the attack time
-        this.#clostToTarget = true;
+        this.lastAttackTime = currentTime;
 
-        // Execute a smart attack strategy based on distance to the target
-        if (distance < this.options.minAttackDist + 0.5) {
-          this.#predictiveAttack();
-        } else {
-          this.#performCombo();
-        }
-      } else {
-        this.#clostToTarget = false;
+        // Smart attack strategy based on distance
+
+        this.#performCombo();
+        console.log(`HIT AT ${distance.toFixed(2)}`);
+      } else if (
+        between(distance, 0.5, this.options.maxAttackDist) &&
+        !this.#eatingGap
+      ) {
+        this.isAttacking = true;
+        this.lastAttackTime = currentTime;
+
+        this.#predictiveAttack();
+        console.log(`HIT AT ${distance.toFixed(2)}`);
       }
 
-      // Ensure the bot only resets its attack state after the cooldown has fully passed
+      // Reset attack state after cooldown
       setTimeout(() => {
         this.isAttacking = false;
-      }, this.heldItemCooldown);
+      }, this.heldItemCooldown + getRandomInRange(-3, 3));
     }
   }
 
   // Predictive attack logic with single attack control
   #predictiveAttack() {
-    if (this.isAttacking) return; // Avoid multiple attacks on the same tick
     this.#bot.setControlState("jump", true);
+    this.#bot.setControlState("back", true);
     setTimeout(() => {
       this.#bot.setControlState("jump", false);
+      this.#bot.setControlState("back", false);
       this.#toggleStrafeDirection(); // Switch strafe direction mid-air for unpredictability
     }, 200);
-
-    this.#bot.attack(this.target);
+    
     this.#bot.setControlState("sprint", true); // Reset sprint to gain momentum
+    this.#bot.attack(this.target);
+
     this.emit("hit");
   }
 
   // Combo attack logic with improved timing control
   #performCombo() {
-    if (this.isAttacking) return; // Ensure no duplicate attacks within the tick
-    this.#bot.setControlState("sprint", true);
     this.#bot.attack(this.target);
-    this.#bot.setControlState("sprint", false);
-
-    // Execute the second attack in a timed combo sequence
     setTimeout(() => {
-      this.#bot.attack(this.target);
-      this.#wtap();
+      if (Math.random() < 0.5) {
+        this.#wtap();
+      } else this.#stap();
+
       this.#adaptiveDodge();
-    }, 150);
+    }, 10);
 
     this.emit("comboHit");
   }
@@ -221,7 +311,7 @@ class AshPvP extends EventEmitter {
 
     setTimeout(() => {
       this.#bot.setControlState(dodgeDirection, false);
-    }, 300); // Adjust dodge duration as needed
+    }, 300);
   }
 
   // W-tap technique to reset sprint and increase knockback
@@ -237,6 +327,25 @@ class AshPvP extends EventEmitter {
     }, 50); // Slight delay to make the W-tap more effective
   }
 
+  #stap() {
+    this.#stapping = true;
+    this.#bot.setControlState("sprint", false);
+    this.#bot.setControlState("forward", false);
+    this.#bot.setControlState("back", true);
+
+    setTimeout(() => {
+      this.#bot.setControlState("sprint", true);
+      this.#bot.setControlState("forward", true);
+      this.#bot.setControlState("back", false);
+      this.#stapping = false;
+    }, 30);
+  }
+
+  #toggleStrafeDirection() {
+    this.currentStrafeDirection =
+      this.currentStrafeDirection === "left" ? "right" : "left";
+  }
+
   /**
    * Runs every tick
    */
@@ -245,13 +354,13 @@ class AshPvP extends EventEmitter {
     this.updateTeamates();
 
     this.lookAtTarget();
-    this.attackTick();
     this.ffaTick();
     this.followTarget();
     this.equip();
     this.updateMainHand();
     this.updateOffhand();
     this.eatGap();
+    this.attackTick();
   }
 
   updateTeamates() {
@@ -276,41 +385,53 @@ class AshPvP extends EventEmitter {
 
     const currentPosition = this.#bot.entity.position;
     const targetPosition = this.target.position;
-
     const distance = calculateDistanceInBox(currentPosition, targetPosition);
 
+    // Ignore targets outside follow range
     if (distance > this.options.maxFollowRange) {
+      this.#bot.setControlState("forward", false);
+      this.#bot.setControlState("sprint", false);
       return;
     }
 
+    // Handle collision: jump and adjust movement
+    if (this.#bot.entity.collidedHorizontally) {
+      this.#bot.setControlState("jump", true);
+      setTimeout(() => this.#bot.setControlState("jump", false), 200);
+    }
+
+    // Stop moving if close to the target
     if (distance <= 1.4) {
       this.#bot.setControlState("forward", false);
+      this.#bot.setControlState("sprint", false);
+      this.#bot.setControlState("back", true);
       return;
     }
 
-    if (!this.#wtapping) {
-      this.#bot.setControlState("forward", true);
-      this.#bot.setControlState("sprint", true);
+    // Enable forward and sprint movements
+    this.#bot.setControlState("back", false);
+    this.#bot.setControlState("forward", true);
+    this.#bot.setControlState("sprint", true);
 
-      // if (this.#clostToTarget) {
-      //   const currentTime = Date.now();
+    // Strafe dynamically if close to the target
+    if (distance <= this.options.minAttackDist + 1.0) {
+      const currentTime = Date.now();
+      if (currentTime - this.lastStrafeChangeTime >= this.strafeDuration) {
+        this.#toggleStrafeDirection();
+        this.lastStrafeChangeTime = currentTime;
+      }
 
-      //   if (currentTime - this.lastStrafeChangeTime >= this.strafeDuration) {
-      //     this.#toggleStrafeDirection();
-      //     this.lastStrafeChangeTime = currentTime;
-      //   }
-
-      //   if (this.currentStrafeDirection === "left") {
-      //     this.#bot.setControlState("left", true);
-      //     this.#bot.setControlState("right", false);
-      //   } else {
-      //     this.#bot.setControlState("left", false);
-      //     this.#bot.setControlState("right", true);
-      //   }
-      // } else {
-      //   this.#bot.setControlState("left", false);
-      //   this.#bot.setControlState("right", false);
-      // }
+      if (this.currentStrafeDirection === "left") {
+        this.#bot.setControlState("left", true);
+        this.#bot.setControlState("right", false);
+      } else {
+        this.#bot.setControlState("left", false);
+        this.#bot.setControlState("right", true);
+      }
+    } else {
+      // Stop strafing when far from the target
+      this.#bot.setControlState("left", false);
+      this.#bot.setControlState("right", false);
     }
   }
 
@@ -351,12 +472,6 @@ class AshPvP extends EventEmitter {
       this.#bot.deactivateItem();
       this.#eatingGap = false;
     }
-  }
-
-  #toggleStrafeDirection() {
-    // Toggle between "left" and "right"
-    this.currentStrafeDirection =
-      this.currentStrafeDirection === "left" ? "right" : "left";
   }
 
   lookAtTarget() {
@@ -437,7 +552,13 @@ class AshPvP extends EventEmitter {
     }
   }
 
+  toggleUpdateMainHand() {
+    this.#canUpdateMainHand = !this.#canUpdateMainHand;
+  }
+
   async updateMainHand() {
+    if (!this.#canUpdateMainHand) return;
+
     const bot = this.#bot;
     // Loop through bots inventory
     // check if the item is a sword
@@ -472,7 +593,7 @@ class AshPvP extends EventEmitter {
 
     if (!bestSword) return;
 
-    if (bot.heldItem && bot.heldItem.name.includes(bestSword.name)) return;
+    if (bot.heldItem && bot.heldItem === bestSword) return;
 
     await bot.equip(bestSword);
   }
