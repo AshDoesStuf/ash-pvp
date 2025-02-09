@@ -1,8 +1,13 @@
 {
   "wooden_sword": 4,
-  "golden_sword": 4,
   "stone_sword": 5,
   "iron_sword": 6,
   "diamond_sword": 7,
-  "netherite_sword": 8
+  "netherite_sword": 8,
+  "wooden_axe": 7,
+  "stone_axe": 9,
+  "iron_axe": 9,
+  "diamond_axe": 9,
+  "netherite_axe": 10,
+  "trident": 9
 }
