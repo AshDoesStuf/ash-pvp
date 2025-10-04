@@ -85,17 +85,17 @@ function aStar(bot, startPos, targetPos) {
     openSet.sort((a, b) => a.f - b.f);
     let current = openSet.shift();
 
-    if (
-      calculateDistanceInBox(current, targetPos) <= 2
-    ) {
-      
+    if (calculateDistanceInBox(current, targetPos) <= 2) {
       let path = [];
       while (current) {
         path.push({ x: current.x, y: current.y, z: current.z });
         current = current.parent;
       }
       // console.log(path)
-      return path.reverse();
+
+      const reversed = path.reverse();
+
+      return removeFirst(reversed);
     }
 
     closedSet.add(`${current.x},${current.y},${current.z}`);
@@ -117,6 +117,11 @@ function aStar(bot, startPos, targetPos) {
   }
 
   return null; // No path found
+}
+
+function removeFirst(arr) {
+  arr.shift(); // removes the first element
+  return arr;
 }
 
 module.exports = aStar;

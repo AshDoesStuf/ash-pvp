@@ -8,6 +8,8 @@ const armorPointsMap = require("./utils/armorPoints.json");
 const weaponBase = require("./utils/weaponBase.json");
 const offhandPriority = require("./utils/offhandPriority.json");
 
+const astar = require("./smart.js");
+
 const sleep = (ms = 2000) => {
   return new Promise((r) => {
     setTimeout(r, ms);
@@ -21,6 +23,7 @@ const {
   getItemEnchantments,
   getRandomInRange,
   placeBlock,
+  calculate3DDistance,
 } = require("./utils/utils.js");
 const { GoalNear } = require("../../mineflayer-baritone/src/goal.js");
 const aStar = require("./smart.js");
@@ -48,10 +51,18 @@ class AshPvP extends EventEmitter {
 
   #attackTask = null;
 
+  #lastGapEatTime = 0;
+  #gapCooldownMs = 3000;
+  #gapEatCount = 0;
+
+  #debugEatGap = false;
+
   /**
    * @type {string}
    */
   #lastSelectedOffhand = null;
+
+  #pathingState = false;
 
   constructor(bot) {
     super();
@@ -61,6 +72,8 @@ class AshPvP extends EventEmitter {
     this.#bot = bot;
     this.running = false;
     this.lastUpdate = performance.now();
+    this.paused = false;
+    this.combatEnabled = false;
 
     this.options = {
       /**
@@ -70,7 +83,7 @@ class AshPvP extends EventEmitter {
       /**
        * The maximum attack distance/reach
        */
-      maxAttackDist: 3,
+      maxAttackDist: 2.8,
       /**
        * The max range for following untill we can use pathfinder
        */
@@ -98,7 +111,12 @@ class AshPvP extends EventEmitter {
       /**
        * Distance we can crystal at
        */
-      crystalDistance: 6,
+      crystalDistance: 4,
+
+      /**
+       * Only use ranged attacks
+       */
+      bowPvP: false,
     };
 
     /**
@@ -137,10 +155,14 @@ class AshPvP extends EventEmitter {
     this.recalculateThreshold = 2;
 
     this.isPathing = false;
+    this.isPearling = false;
+    this.canBowTarget = false;
 
     this.trackToggle = false;
     this.canPlaceObstacle = false;
     this.placing = false;
+
+    this.isNetherite = this.checkNetherite();
 
     (async () => {
       /**
@@ -175,20 +197,37 @@ class AshPvP extends EventEmitter {
     this.startUpdateLoop();
   }
 
+  getCurrentSettings() {
+    return this.options;
+  }
+
+  updateSettings(newSettings) {
+    Object.assign(this.options, newSettings);
+  }
+
+  updateSetting(key, value) {
+    if (this.options.hasOwnProperty(key)) {
+      this.options[key] = value;
+    } else {
+      console.error(`Setting ${key} does not exist.`);
+    }
+  }
+
   startUpdateLoop() {
     if (this.running) return;
     this.running = true;
 
-    const tickRate = 50; // Run the loop every 50ms (20 times per second)
+    const tickRate = 50;
 
     const update = () => {
       if (!this.running) return;
 
-      const now = performance.now();
-      const deltaTime = (now - this.lastUpdate) / 1000;
-      this.lastUpdate = now;
-
-      this.updateTick(deltaTime);
+      if (!this.paused) {
+        const now = performance.now();
+        const deltaTime = (now - this.lastUpdate) / 1000;
+        this.lastUpdate = now;
+        this.updateTick(deltaTime);
+      }
 
       setTimeout(update, tickRate);
     };
@@ -196,8 +235,43 @@ class AshPvP extends EventEmitter {
     update();
   }
 
+  pause(duration = null) {
+    this.paused = true;
+    if (duration !== null) {
+      setTimeout(() => {
+        this.paused = false;
+        this.lastUpdate = performance.now(); // prevent huge delta after pause
+      }, duration);
+    }
+  }
+
+  resume() {
+    this.paused = false;
+    this.lastUpdate = performance.now(); // reset timing to avoid delta spike
+  }
+
   stopUpdateLoop() {
     this.running = false;
+  }
+  checkNetherite() {
+    const bot = this.#bot;
+    let netheriteCount = 0;
+
+    const armorSlots = [
+      bot.getEquipmentDestSlot("head"),
+      bot.getEquipmentDestSlot("torso"),
+      bot.getEquipmentDestSlot("legs"),
+      bot.getEquipmentDestSlot("feet"),
+    ];
+
+    for (const slot of armorSlots) {
+      const item = bot.inventory.slots[slot];
+      if (item && item.name.includes("netherite")) {
+        netheriteCount++;
+      }
+    }
+
+    return netheriteCount >= 3; // Threshold for "netherite PvP"
   }
 
   /**
@@ -230,7 +304,8 @@ class AshPvP extends EventEmitter {
           }
 
           this.#attackTask = null;
-          this.stop();
+          this.target = null; // Clear the target
+          this.stop(!this.ffaToggle);
           resolve(); // Resolve the promise
         }
       };
@@ -246,7 +321,8 @@ class AshPvP extends EventEmitter {
             this.possibleTargets.delete(target.id);
           }
           this.#attackTask = null;
-          this.stop();
+          this.target = null; // Clear the target
+          this.stop(!this.ffaToggle);
           resolve(); // Resolve the promise
         }
       };
@@ -256,6 +332,8 @@ class AshPvP extends EventEmitter {
         this.#bot.removeListener("entityDead", onDeath); // Clean up the listener
         this.#bot.removeListener("entityGone", onGone);
         this.#bot.removeListener("death", onError); // Clean up the listener
+        this.#attackTask = null;
+        this.target = null; // Clear the target
         reject("Bot died ig");
       };
 
@@ -268,8 +346,9 @@ class AshPvP extends EventEmitter {
   /**
    * Tell bot to attack anyone in sight
    */
-  ffa() {
+  ffa(options = {}) {
     this.ffaToggle = !this.ffaToggle;
+    this.ffaOptions = options;
   }
 
   /**
@@ -306,41 +385,57 @@ class AshPvP extends EventEmitter {
   async ffaTick() {
     if (!this.ffaToggle) return;
 
-    // If there's an active target, check if we should switch after some time
     if (this.target) {
       const elapsed = Date.now() - this.targetAcquiredAt;
       if (elapsed < this.options.targetSwitchInterval) {
-        return; // Continue attacking the current target
+        return;
       }
 
-      // Reset target after the interval
       this.target = null;
       this.#attackTask = null;
     }
 
-    // Find the nearest player who is not a teammate or a king
-    const nearestPlayer = this.#bot.nearestEntity((entity) => {
-      return (
-        entity.type === "player" &&
-        !this.teamates.includes(entity.username) &&
-        !this.#bot.hivemind.kings.includes(entity.username)
-      );
-    });
-
+    const nearestPlayer = this.#bot.nearestEntity((entity) =>
+      this.isValidTarget(entity)
+    );
     if (!nearestPlayer) return;
 
-    // Set the new target and track the acquisition time
     this.targetAcquiredAt = Date.now();
 
-    // Attack the target
     try {
       await this.attack(nearestPlayer);
     } catch (error) {
-      console.log(error);
+      console.log("Error attacking player:", error);
+    }
+  }
+
+  async isValidTarget(entity) {
+    if (!entity || entity.type !== "player") return false;
+
+    // Skip teammates
+    if (this.teamates.includes(entity.username)) return false;
+
+    // Skip kings
+    if (this.#bot.hivemind.kings.includes(entity.username)) return false;
+
+    // Skip connected BotMind bots if ignoreBotmind is false
+    const connectedBotNames = this.#bot.hivemind.connectedBots.map(
+      (bot) => bot.name
+    );
+    if (
+      this.ffaOptions &&
+      !this.ffaOptions.ignoreBotmind &&
+      connectedBotNames.includes(entity.username)
+    ) {
+      return false;
     }
 
-    // Optionally clear the target after attacking (if immediate switching is desired)
-    // this.target = null;
+    //if target is dead or not in sight
+    if (entity.health <= 0) {
+      return false;
+    }
+
+    return true;
   }
 
   async semiFfaTick() {
@@ -416,15 +511,24 @@ class AshPvP extends EventEmitter {
 
     // Find the best obsidian position for max damage
     const bestPos = this.#findGoodObi();
-    if (!bestPos) return; // No good position found
+    if (!bestPos) {
+      // Try placing obsidian
+      const placePos = this.#findGoodObsidianPlacement();
+      if (placePos && this.#hasObsidian()) {
+        await this.#placeObsidian(placePos);
+      }
+      return;
+    }
 
     // Check if an End Crystal already exists at this position
-    const existingCrystal = bot.findEntity({
-      matching: (e) =>
-        e.name === "end_crystal" && e.position.floored().equals(bestPos),
-    });
+    const existingCrystal = bot.nearestEntity(
+      (e) =>
+        e.name === "end_crystal" &&
+        e.position.floored().distanceTo(bestPos) <= 1.5
+    );
 
     if (existingCrystal) {
+      // console.log("yes");
       // If a crystal exists, check if we should detonate it
       if (this.#shouldDetonate(existingCrystal, target)) {
         this.#detonateCrystal(existingCrystal);
@@ -436,6 +540,24 @@ class AshPvP extends EventEmitter {
     if (this.#hasEndCrystals()) {
       await this.#placeCrystal(bestPos);
     }
+  }
+
+  #hasObsidian() {
+    const bot = this.#bot;
+    return bot.inventory.items().some((item) => item.name === "obsidian");
+  }
+
+  async #placeObsidian(pos) {
+    const bot = this.#bot;
+    const obsidian = bot.inventory.items().find((i) => i.name === "obsidian");
+    if (!obsidian) return;
+
+    await bot.equip(obsidian, "hand");
+
+    const above = pos.offset(0, 1, 0);
+    await bot.placeBlock(bot.blockAt(pos), new Vec3(0, 1, 0)).catch((err) => {
+      console.log("Failed to place obsidian:", err);
+    });
   }
 
   /**
@@ -456,7 +578,10 @@ class AshPvP extends EventEmitter {
    */
   async #detonateCrystal(crystal) {
     if (!crystal) return;
-    await this.#bot.attack(crystal);
+    this.#bot.setControlState("jump", false);
+    this.#bot.attack(crystal);
+
+    this.placingCrystal = false;
   }
 
   /**
@@ -475,71 +600,113 @@ class AshPvP extends EventEmitter {
     const bot = this.#bot;
     if (!this.#hasEndCrystals()) return; // No crystals available
 
+    this.placingCrystal = true;
+    this.toggleUpdateMainHand();
+    await bot.equip(
+      bot.inventory.items().find((item) => item.name === "end_crystal")
+    );
+
     // Place the End Crystal
-    await bot.placeBlock(bot.blockAt(position), new Vec3(0, 1, 0));
+    await placeBlock(bot, "end_crystal", position, false);
 
     // Immediately check if detonation is needed
-    const placedCrystal = bot.findEntity({
-      matching: (e) =>
-        e.name === "end_crystal" && e.position.floored().equals(position),
-    });
+    const placedCrystal = bot.nearestEntity(
+      (e) => e.name === "end_crystal" && e.position.floored().equals(position)
+    );
 
     if (placedCrystal && this.#shouldDetonate(placedCrystal, this.target)) {
       this.#detonateCrystal(placedCrystal);
     }
+
+    this.placingCrystal = false;
+    this.toggleUpdateMainHand();
   }
 
   attackTick() {
-    if (!this.target) return;
+    if (!this.target || this.options.crystalPvP) return;
 
+    const bot = this.#bot;
+    const currentPosition = bot.entity.position;
+    const targetPosition = this.target.position;
+
+    const distance = calculate3DDistance(currentPosition, targetPosition);
+    const verticalDifference = Math.abs(currentPosition.y - targetPosition.y);
+
+    // While on cooldown, don't attack, but allow obstacle placement
     if (this.lastAttackTime < this.heldItemCooldown) {
-      //We still on cooldown
-      const currentPosition = this.#bot.entity.position;
-      const targetPosition = this.target.position;
-      const distance = calculateDistanceInBox(currentPosition, targetPosition);
       this.isAttacking = false;
+
+      // Allow placing blocks if we are close enough to the enemy
       if (
-        between(distance, this.options.maxAttackDist, 4) &&
+        distance <= this.options.maxAttackDist &&
         !this.#eatingGap &&
         !this.placing
       ) {
         this.canPlaceObstacle = true;
       }
+
+      // NEW: Bow fallback during cooldown if target is out of melee range but in follow range
+      if (
+        this.options.bowPvP &&
+        this.#hasBow() &&
+        distance > this.options.maxAttackDist &&
+        distance <= this.options.followDistance
+      ) {
+        this.#rangedAttack();
+      }
+
       return;
     }
 
     this.canPlaceObstacle = false;
-    const currentPosition = this.#bot.entity.position;
-    const targetPosition = this.target.position;
-    const distance = calculateDistanceInBox(currentPosition, targetPosition);
 
-    // const mainHand = this.#bot.heldItem ? this.#bot.heldItem.name : null;
+    // NEW: Bow combat logic even outside of cooldown
+    const useBowCombat =
+      this.options.bowPvP &&
+      this.#hasBow() &&
+      ((distance > this.options.maxAttackDist &&
+        distance <= this.options.followDistance) ||
+        verticalDifference > 3);
 
-    // if (distance > this.options.maxAttackDist + 4 && this.#hasBow()) {
-    //   this.isAttacking = false;
-    //   this.#rangedAttack(distance);
-    //   return;
-    // }
+    if (useBowCombat) {
+      this.#rangedAttack();
+      return;
+    }
 
+    // Melee combat logic
     if (
       distance <= this.options.maxAttackDist &&
       !this.#eatingGap &&
       !this.placing
     ) {
-      this.canPlaceObstacle = false;
       this.isAttacking = true;
 
       if (distance > getRandomInRange(this.options.minAttackDist, 2.4)) {
         this.#performCombo();
-        console.log(`HIT AT ${distance.toFixed(2)} WITH AT DISTANCE MODE`);
+        console.log(`HIT AT ${distance.toFixed(2)} WITH DISTANCE MODE`);
       } else {
         this.#predictiveAttack();
         console.log(`HIT AT ${distance.toFixed(2)} WITH CLOSE RANGE MODE`);
       }
 
       this.lastAttackTime = 0;
-      this.#bot.setControlState("jump", false);
+      bot.setControlState("jump", false);
     }
+  }
+
+  tryBowTarget() {
+    if (!this.target) return;
+
+    const currentPosition = this.#bot.entity.position;
+    const targetPosition = this.target.position;
+    const distance = calculateDistanceInBox(currentPosition, targetPosition);
+
+    if (distance > this.options.maxAttackDist + 4 && this.#hasBow()) {
+      this.canBowTarget = true;
+      return;
+    }
+
+    this.canBowTarget = false;
   }
 
   #hasBow() {
@@ -551,7 +718,7 @@ class AshPvP extends EventEmitter {
     );
   }
 
-  async #rangedAttack(distance) {
+  async #rangedAttack() {
     this.toggleUpdateMainHand();
 
     const bot = this.#bot;
@@ -561,7 +728,7 @@ class AshPvP extends EventEmitter {
 
     await bot.equip(bow, "hand");
 
-    bot.clearControlStates();
+    this.pause(1500);
     bot.hawkEye.oneShot(this.target, Weapons.bow);
     this.toggleUpdateMainHand();
   }
@@ -569,32 +736,55 @@ class AshPvP extends EventEmitter {
   // Predictive attack logic with single attack control
   #predictiveAttack() {
     this.#stap();
+    const bot = this.#bot;
 
-    this.#bot.setControlState("sprint", true); // Reset sprint to gain momentum
-    this.#bot.attack(this.target);
+    if (this.isNetherite && Math.random() < this.options.critChance) {
+      bot.setControlState("forward", false);
+      bot.setControlState("sprint", false);
+      bot.setControlState("jump", true);
 
-    this.emit("hit");
+      setTimeout(() => {
+        bot.attack(this.target);
+        bot.setControlState("jump", false);
+        this.emit("hit");
+      }, 100); // attack while falling
+    } else {
+      bot.setControlState("sprint", true); // reset sprint
+      bot.attack(this.target);
+      this.emit("hit");
+    }
   }
 
   // Combo attack logic with improved timing control
   async #performCombo() {
-    if (Math.random() < this.options.critChance) {
-      this.#bot.setControlState("jump", true);
+    const bot = this.#bot;
+
+    // If we're in Netherite PvP, attempt a proper crit
+    if (this.isNetherite && Math.random() < this.options.critChance) {
       this.#bot.setControlState("forward", false);
       this.#bot.setControlState("sprint", false);
+      this.#bot.setControlState("jump", true);
       this.#critting = true;
+
+      // Wait ~100ms to be mid-air before attacking
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      this.#bot.attack(this.target);
+      this.#bot.setControlState("jump", false);
+    } else {
+      // Non-Netherite (or failed crit chance) combo behavior
+      this.#bot.attack(this.target);
     }
 
-    this.#bot.attack(this.target);
-
-    if (!this.#critting)
+    // W-tap logic only when not critting (i.e., Diamond PvP)
+    if (!this.#critting) {
       setTimeout(() => {
         if (Math.random() < 0.5) {
           this.#wtap();
-        } else this.#stap();
-
-        // this.#adaptiveDodge();
+        } else {
+          this.#stap();
+        }
       }, getRandomInRange(1, 5));
+    }
 
     this.#critting = false;
     this.emit("comboHit");
@@ -650,18 +840,30 @@ class AshPvP extends EventEmitter {
     this.heldItemCooldown = this.calculateHeldItemCooldown();
     this.updateTeamates();
     this.updateAttackTime(deltaTime);
+    this.isNetherite = this.checkNetherite();
 
-    this.eatGap();
-    // this.lookAtTarget();
-    this.trackTarget();
+    this.lookAtTarget();
+    // this.trackTarget();
     this.ffaTick();
     this.semiFfaTick();
     this.followTarget();
     this.equip();
-    this.updateMainHand();
-    this.updateOffhand();
-    this.placeObstacle();
-    this.attackTick();
+    if (this.combatEnabled) {
+      this.eatGap();
+      this.updateMainHand();
+      this.updateOffhand();
+      this.placeObstacle();
+      this.attackTick();
+      this.crystalTick();
+    }
+  }
+
+  enableCombat() {
+    this.combatEnabled = true;
+  }
+
+  disableCombat() {
+    this.combatEnabled = false;
   }
 
   updateTeamates() {
@@ -681,174 +883,341 @@ class AshPvP extends EventEmitter {
     }
   }
 
+  test(target) {
+    const path = astar(this.#bot, this.#bot.entity.position, target.position);
+
+    console.log(path);
+  }
+
+  //#region movement
+
   async followTarget() {
     if (!this.target) return;
 
-    const currentPosition = this.#bot.entity.position;
-    const targetPosition = this.target.position;
-    const distance = calculateDistanceInBox(currentPosition, targetPosition);
+    const botPos = this.#bot.entity.position;
+    const targetPos = this.target.position;
+    const distance = calculateDistanceInBox(botPos, targetPos);
+    const targetMoved =
+      this.lastTargetPos && this.lastTargetPos.distanceTo(targetPos) > 1.5;
 
-    const now = Date.now();
+    // If target moved significantly or we have no path, recalculate
+    if (
+      (!this.lastPath ||
+        targetMoved ||
+        this.pathIndex >= this.lastPath.length) &&
+      !this.isPathing
+    ) {
+      this.#bot.clearControlStates();
+      this.isPathing = true;
+      this.pause();
 
-    if (distance > this.options.maxFollowRange) {
-      // if (
-      //   this.lastPath.length === 0 || // No path stored
-      //   this.pathIndex >= this.lastPath.length || // Reached end of path
-      //   now - this.lastAStarTime > 1000 || // Cooldown expired
-      //   calculateDistanceInBox(
-      //     this.lastPath[this.lastPath.length - 1],
-      //     targetPosition
-      //   ) > this.recalculateThreshold // Target moved
-      // ) {
-      //   this.lastPath = aStar(this.#bot, currentPosition, targetPosition) || [];
-      //   this.pathIndex = 0;
-      //   this.lastAStarTime = now;
-      // }
+      const path = astar(this.#bot, botPos, targetPos);
+      if (!path || path.length === 0) {
+        console.log("No path found, fallback.");
+        this.isPathing = false;
+        this.tryBowTarget?.();
+        this.resume();
+        return;
+      }
 
-      // // Follow the path
-      // if (this.lastPath.length > 1 && this.pathIndex < this.lastPath.length) {
-      //   const nextNode = this.lastPath[this.pathIndex];
-      //   this.isPathing = true;
+      this.lastPath = path;
+      this.pathIndex = 0;
+      this.lastTargetPos = targetPos.clone();
 
-      //   // Move to next position
-      //   this.#bot.lookAt(
-      //     new Vec3(nextNode.x, currentPosition.y + 1.5, nextNode.z)
-      //   );
-      //   this.#bot.setControlState("forward", true);
-
-      //   // Move to the next node when close enough
-      //   if (calculateDistanceInBox(currentPosition, nextNode) < 0.5) {
-      //     this.pathIndex++;
-      //   }
-      // }
-
+      await this.#moveAlongPath();
       return;
     }
 
+    // Fallback to normal movement/PvP logic if already in range
     if (this.placing) return;
 
-    if (distance <= 1.8) {
-      this.#bot.setControlState("back", true);
-      this.#bot.setControlState("forward", false);
-      this.#bot.setControlState("sprint", false);
-      this.#bot.setControlState("jump", false);
-      this.isPathing = false;
-      return;
-    }
-
-    if (!this.#critting && !this.isPathing) {
-      this.#bot.setControlState("back", false);
+    if (this.options.bowPvP) {
+      this.#handleBowStrafe(distance);
+    } else if (!this.#critting && !this.isPathing) {
       this.#bot.setControlState("forward", true);
       this.#bot.setControlState("sprint", true);
 
-      if (distance > this.options.maxAttackDist) {
+      if (distance > this.options.maxAttackDist && !this.options.crystalPvP) {
         this.#bot.setControlState("jump", true);
       }
+
+      this.#handleDynamicStrafe(distance);
+      this.#handleCollisionJump();
+    }
+  }
+
+  async #moveAlongPath() {
+    const path = this.lastPath;
+    this.#bot.clearControlStates();
+
+    while (this.pathIndex < path.length && this.target) {
+      const point = path[this.pathIndex];
+      const targetVec = new Vec3(point.x, point.y, point.z);
+      const botPos = this.#bot.entity.position;
+      const dist = botPos.distanceTo(targetVec);
+
+      this.#bot.lookAt(targetVec.offset(0, 1.6, 0), true);
+
+      // Jump logic
+      const verticalDiff = targetVec.y - botPos.y;
+      if (verticalDiff > 0.1 && this.#bot.entity.onGround) {
+        this.#bot.setControlState("jump", true);
+      } else {
+        this.#bot.setControlState("jump", false);
+      }
+
+      this.#bot.setControlState("forward", true);
+      this.#bot.setControlState("sprint", dist > 3 && verticalDiff < 0.1);
+
+      if (dist < 0.6) this.pathIndex++;
+
+      const targetDist = this.#bot.entity.position.distanceTo(
+        this.target.position
+      );
+      if (targetDist <= this.options.maxFollowRange) {
+        console.log("Close enough, stop pathing.");
+        break;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
 
-    // Strafe dynamically if close to the target
-    if (distance <= this.options.minAttackDist + 1.0) {
-      const currentTime = Date.now();
-      if (currentTime - this.lastStrafeChangeTime >= this.strafeDuration) {
+    this.isPathing = false;
+    this.resume();
+    this.#bot.clearControlStates();
+  }
+
+  #handleBowStrafe(distance) {
+    const idealRange = 12;
+    const tolerance = 1.5;
+
+    if (distance < idealRange - tolerance) {
+      this.#bot.setControlState("back", true);
+      this.#bot.setControlState("forward", false);
+    } else if (distance > idealRange + tolerance) {
+      this.#bot.setControlState("forward", true);
+      this.#bot.setControlState("back", false);
+    } else {
+      this.#bot.setControlState("forward", false);
+      this.#bot.setControlState("back", false);
+
+      const now = Date.now();
+      if (now - this.lastStrafeChangeTime > this.strafeDuration) {
         this.#toggleStrafeDirection();
-        this.lastStrafeChangeTime = currentTime;
+        this.lastStrafeChangeTime = now;
       }
 
-      if (this.currentStrafeDirection === "left") {
-        this.#bot.setControlState("left", true);
-        this.#bot.setControlState("right", false);
-      } else {
-        this.#bot.setControlState("left", false);
-        this.#bot.setControlState("right", true);
-      }
-    } else {
-      // Stop strafing when far from the target
+      this.#bot.setControlState("left", this.currentStrafeDirection === "left");
+      this.#bot.setControlState(
+        "right",
+        this.currentStrafeDirection === "right"
+      );
+    }
+
+    this.#bot.setControlState("sprint", false);
+    this.#bot.setControlState("jump", false);
+    this.isPathing = false;
+  }
+
+  #handleDynamicStrafe(distance) {
+    const inRange = distance <= this.options.minAttackDist + 1.0;
+    const now = Date.now();
+    if (inRange && now - this.lastStrafeChangeTime >= this.strafeDuration) {
+      this.#toggleStrafeDirection();
+      this.lastStrafeChangeTime = now;
+    }
+
+    this.#bot.setControlState(
+      "left",
+      inRange && this.currentStrafeDirection === "left"
+    );
+    this.#bot.setControlState(
+      "right",
+      inRange && this.currentStrafeDirection === "right"
+    );
+
+    if (!inRange) {
       this.#bot.setControlState("left", false);
       this.#bot.setControlState("right", false);
     }
+  }
 
+  #handleCollisionJump() {
     if (this.#bot.entity.isCollidedHorizontally) {
       this.#bot.setControlState("jump", true);
       setTimeout(() => this.#bot.setControlState("jump", false), 200);
     }
   }
 
-  async eatGap() {
-    if (!this.target) return; //really on auto eat plugin
+  //#endregion
 
-    const health = this.#bot.health;
-
-    // Don't eat if health is above 15
-    if (health > 15) return;
-
-    const gap = this.#bot.inventory.slots.find(
-      (item) => item !== null && item.name.includes("golden_apple")
-    );
-
-    if (!gap) return;
-
-    const ofhandslot = this.#bot.getEquipmentDestSlot("off-hand");
-    let hasGapInOffhand =
-      this.#bot.inventory.slots[ofhandslot] !== null &&
-      this.#bot.inventory.slots[ofhandslot].name.includes("golden_apple");
-
-    // effect object with the key being the effect's id
-    const effects = this.#bot.entity.effects;
-
-    // If we have regeneration and health is decent, don't eat
-    if (effects["10"] && health > 17) return;
-
-    // If already eating, return
-    if (this.#eatingGap) return;
-
-    // ⚠️ Avoid eating when an enemy is nearby!
-    const enemyNearby = this.#bot.nearestEntity(
-      (entity) =>
-        entity.id === this.target.id &&
-        entity.position.distanceTo(this.#bot.entity.position) < 3
-    );
-
-    if (enemyNearby && health > 10) return; // Only eat if we're in danger
-
-    this.#eatingGap = true;
-    this.#bot.autoEat.disable();
-    this.toggleUpdateOffhand();
-
-    if (hasGapInOffhand) {
-      this.#bot.activateItem(true);
-      await sleep(1601);
-      this.#bot.deactivateItem(true);
-    } else {
-      await this.#bot.equip(gap, "off-hand");
-
-      this.#bot.activateItem(true);
-      await sleep(1601);
-      this.#bot.deactivateItem(true);
-    }
-
-    this.#eatingGap = false;
-    this.#bot.autoEat.enable();
-    this.toggleUpdateOffhand();
+  async waitForPearl() {
+    return new Promise((resolve) => {
+      this.#bot.once("forcedMove", () => {
+        resolve();
+      });
+    });
   }
 
-  async lookAtTarget() {
-    if (!this.target) return;
+  getGapEatStats() {
+    return {
+      timesEaten: this.#gapEatCount,
+      lastAte: new Date(this.#lastGapEatTime).toLocaleTimeString(),
+    };
+  }
 
-    if (this.isPathing) return;
+  async eatGap() {
+    const now = Date.now();
+    const bot = this.#bot;
 
-    if (this.placing) return;
+    // Basic conditions
+    if (!this.target) {
+      if (this.#debugEatGap) console.log("[eatGap] Skipping: No target");
+      return;
+    }
 
-    if (this.#eatingGap) return;
+    const health = bot.health;
+    const effects = bot.entity.effects;
 
-    const currentPosition = this.#bot.entity.position;
-    const dx = this.target.position.x - currentPosition.x;
-    const dz = this.target.position.z - currentPosition.z;
+    // Adaptive cooldown (shorter if health is low)
+    const pressureCooldown = health <= 10 ? 1500 : this.#gapCooldownMs;
+    if (now - this.#lastGapEatTime < pressureCooldown) {
+      if (this.#debugEatGap)
+        console.log(
+          `[eatGap] Skipping: Cooldown active (${
+            now - this.#lastGapEatTime
+          }ms ago)`
+        );
+      return;
+    }
 
-    const yaw = Math.atan2(-dx, -dz);
+    if (health > 15) {
+      if (this.#debugEatGap)
+        console.log(`[eatGap] Skipping: Health is ${health}`);
+      return;
+    }
 
-    // this.#bot.look(yaw, 0, true);
+    if (effects["10"] && health > 17) {
+      if (this.#debugEatGap)
+        console.log("[eatGap] Skipping: Regeneration effect active");
+      return;
+    }
 
-    this.#bot.look(yaw, 0, true);
+    if (this.#eatingGap) {
+      if (this.#debugEatGap) console.log("[eatGap] Skipping: Already eating");
+      return;
+    }
+
+    // Priority logic: Only eat if you're in a 1vX situation or close to death
+    const nearbyHostiles = bot.nearestEntity(
+      (entity) =>
+        entity.type === "mob" &&
+        entity.position.distanceTo(bot.entity.position) <= 6 &&
+        entity.name !== bot.username
+    );
+    const enemyClose =
+      this.target.position.distanceTo(bot.entity.position) <= 3;
+
+    const multipleEnemies =
+      Array.isArray(bot.players) &&
+      Object.values(bot.players).filter(
+        (p) =>
+          p.entity &&
+          p.entity.position.distanceTo(bot.entity.position) < 6 &&
+          p.username !== bot.username
+      ).length > 1;
+
+    if (!multipleEnemies && enemyClose && health > 10) {
+      if (this.#debugEatGap)
+        console.log(
+          "[eatGap] Skipping: Only 1 enemy close and health is not low"
+        );
+      return;
+    }
+
+    // Find golden apple
+    const gap = bot.inventory.slots.find(
+      (item) => item && item.name.includes("golden_apple")
+    );
+    if (!gap) {
+      if (this.#debugEatGap)
+        console.log("[eatGap] Skipping: No golden apple in inventory");
+      return;
+    }
+
+    const offHandSlot = bot.getEquipmentDestSlot("off-hand");
+    const gapInOffhand =
+      bot.inventory.slots[offHandSlot]?.name.includes("golden_apple");
+
+    // Begin eating process
+    this.#eatingGap = true;
+    this.#lastGapEatTime = now;
+    this.#gapEatCount++;
+    bot.autoEat.disable();
+    this.toggleUpdateOffhand();
+    this.pause();
+
+    if (this.#debugEatGap)
+      console.log(
+        `[eatGap] 🍏 Eating golden apple [#${
+          this.#gapEatCount
+        }] | Health: ${health} | Under pressure: ${multipleEnemies}`
+      );
+
+    try {
+      if (!gapInOffhand) {
+        if (this.#debugEatGap)
+          console.log("[eatGap] Equipping golden apple to off-hand");
+        await bot.equip(gap, "off-hand");
+      } else {
+        if (this.#debugEatGap)
+          console.log("[eatGap] Golden apple already in off-hand");
+      }
+
+      bot.activateItem(true);
+      await sleep(1601);
+      bot.deactivateItem(true);
+
+      if (this.#debugEatGap) console.log("[eatGap] ✅ Finished eating");
+    } catch (err) {
+      console.error("[eatGap] ❌ Error while eating:", err);
+    }
+
+    this.resume();
+    bot.autoEat.enable();
+    this.toggleUpdateOffhand();
+    this.#eatingGap = false;
+  }
+  #lastLookUpdate = 0;
+  #lookCooldown = 50; // ms between forced look updates (to reduce jitter)
+
+  lookAtTarget(force = false) {
+    if (!this.target || this.isPathing || this.placing || this.#eatingGap)
+      return;
+
+    const now = Date.now();
+    if (!force && now - this.#lastLookUpdate < this.#lookCooldown) return;
+
+    const bot = this.#bot;
+    const pos = bot.entity.position;
+    const targetPos = this.target.position;
+
+    const dx = targetPos.x - pos.x;
+    const dz = targetPos.z - pos.z;
+
+    const desiredYaw = Math.atan2(-dx, -dz);
+    const currentYaw = bot.entity.yaw;
+
+    const deltaYaw = Math.abs(desiredYaw - currentYaw);
+
+    // Minimum threshold to rotate (avoids micro-adjustment)
+    const yawThreshold = 0.01;
+
+    if (deltaYaw > yawThreshold || force) {
+      this.#lastLookUpdate = now;
+      // Fast look with no await – use "force" true to skip smooth interpolation
+      bot.look(desiredYaw, 0, true); // pitch 0 is assumed here; can calculate if needed
+    }
   }
 
   calculateHeldItemCooldown() {
@@ -958,7 +1327,68 @@ class AshPvP extends EventEmitter {
       }
     }
 
-    return bestObi; // Returns the best obsidian block for max damage
+    return bestObi.floored(); // Returns the best obsidian block for max damage
+  }
+
+  #findGoodObsidianPlacement() {
+    const bot = this.#bot;
+    const target = this.target;
+    if (!target) return null;
+
+    const origin = target.position.floored();
+
+    const candidateOffsets = [
+      new Vec3(1, 0, 0),
+      new Vec3(-1, 0, 0),
+      new Vec3(0, 0, 1),
+      new Vec3(0, 0, -1),
+      new Vec3(1, 0, 1),
+      new Vec3(-1, 0, -1),
+      new Vec3(1, 0, -1),
+      new Vec3(-1, 0, 1),
+      new Vec3(0, -1, 0), // Directly below target (optional)
+    ];
+
+    let bestPos = null;
+    let bestScore = -Infinity;
+
+    for (const offset of candidateOffsets) {
+      const pos = origin.plus(offset);
+
+      const blockBelow = bot.blockAt(pos);
+      const blockAtPos = bot.blockAt(pos.offset(0, 1, 0));
+      const blockAbove = bot.blockAt(pos.offset(0, 2, 0));
+
+      const canPlace =
+        blockBelow &&
+        blockBelow.name !== "air" && // Has something to place on
+        blockAtPos &&
+        blockAtPos.name === "air" &&
+        blockAbove &&
+        blockAbove.name === "air";
+
+      const distance = bot.entity.position.distanceTo(pos);
+
+      if (
+        canPlace &&
+        distance <= 4.5 && // Within reach
+        bot.canSeeBlock(bot.blockAt(pos.offset(0, 1, 0))) // Can see top face
+      ) {
+        const damage = bot.getExplosionDamages(
+          target,
+          pos.offset(0, 1, 0),
+          this.options.crystalDistance,
+          true
+        );
+
+        if (damage > bestScore) {
+          bestScore = damage;
+          bestPos = pos;
+        }
+      }
+    }
+
+    return bestPos; // Where to place obsidian
   }
 
   async placeObstacle() {
@@ -982,7 +1412,7 @@ class AshPvP extends EventEmitter {
 
     // Find the nearest enemy within 3 blocks
     const near =
-      calculateDistanceInBox(this.#bot.entity.position, this.target.position) <=
+      calculateDistanceInBox(this.#bot.entity.position, this.target.position) <
       4;
     if (!near) return;
 
@@ -1002,6 +1432,7 @@ class AshPvP extends EventEmitter {
     this.#bot.setControlState("jump", false);
 
     try {
+      this.pause();
       await this.#bot.equip(randomItem, "hand");
 
       const placePos = this.target.position;
@@ -1036,10 +1467,111 @@ class AshPvP extends EventEmitter {
       console.log(err);
       this.toggleUpdateMainHand();
       this.placing = false;
+      this.resume();
     } finally {
       this.toggleUpdateMainHand();
       this.placing = false;
+      this.resume();
     }
+  }
+
+  async pearlAway(offestEntity = this.#bot.entity) {
+    const { position } = offestEntity;
+    let block = null;
+    let foundBlock = false;
+    let success = false;
+    let retries = 0;
+    let maxDistance = 10;
+    let minDistance = 5;
+    let MaxTries = 3;
+
+    const getBlock = () => {
+      for (let i = 0; i < 20; i++) {
+        const offset = position.offset(
+          Math.floor(Math.random() * (maxDistance - minDistance)) + minDistance,
+          0,
+          Math.floor(Math.random() * (maxDistance - minDistance)) + minDistance
+        );
+        block = this.bot.blockAt(offset, true);
+        console.log("===========================");
+        console.log(
+          `Checking block at (${Math.floor(offset.x)}, ${Math.floor(
+            offset.y
+          )}, ${Math.floor(offset.z)})`
+        );
+        if (block) {
+          console.log(
+            `Block found at (${Math.floor(offset.x)}, ${Math.floor(
+              offset.y
+            )}, ${Math.floor(offset.z)})`
+          );
+          foundBlock = true;
+          break;
+        }
+      }
+    };
+
+    while (!success && retries < MaxTries) {
+      getBlock();
+
+      if (foundBlock) {
+        this.isPearling = true;
+        if (this.#bot.getControlState("forward")) {
+          this.#bot.setControlState("forward", false);
+        }
+
+        if (this.#bot.health <= 8) {
+          this.isPearling = false;
+          return false;
+        }
+
+        const pearl = this.#bot.inventory
+          .items()
+          .find((item) => item.name === "ender_pearl");
+
+        if (!pearl) {
+          this.isPearling = false;
+          return false;
+        }
+        console.log(`Pearl item found: ${pearl?.count}`);
+        const shot = this.#bot.hawkEye.getMasterGrade(
+          { position: block.position },
+          new Vec3(0, 0.05, 0),
+          "ender_pearl"
+        );
+        console.log(
+          `Shot information: ${shot ? Math.floor(shot.yaw) : "nope"}, ${
+            shot ? Math.floor(shot.pitch) : "nada"
+          }`
+        );
+        await this.#bot.equip(pearl, "hand");
+        try {
+          if (shot) {
+            await this.#bot.look(shot.yaw, shot.pitch, true);
+            await this.#bot.equip(pearl, "hand");
+            this.#bot.activateItem(false);
+
+            await this.waitForPearl();
+            this.isPearling = false;
+            success = true;
+            console.log("Pearling succeeded");
+            return success;
+          }
+        } catch {
+          console.error("Pearling failed");
+        }
+        if (!success) {
+          console.log(`Retry ${retries + 1}`);
+          retries++;
+          await sleep(500); // wait 1 second before retrying
+        }
+      } else {
+        console.log("No block found after 20 ts");
+        return false;
+      }
+    }
+
+    this.isPearling = false;
   }
 
   toggleUpdateMainHand() {
@@ -1061,6 +1593,7 @@ class AshPvP extends EventEmitter {
   async updateMainHand() {
     if (!this.canUpdateMainHand()) return;
     if (this.placing) return;
+    if (this.placingCrystal) return;
 
     const bot = this.#bot;
 
@@ -1147,8 +1680,8 @@ class AshPvP extends EventEmitter {
     this.#lastSelectedOffhand = bestItem.name;
   }
 
-  stop() {
-    // this.ffaToggle = false;
+  stop(withFFA = true) {
+    if (withFFA) this.ffaToggle = false;
     this.trackToggle = false;
     this.target = null;
     this.possibleTargets.clear();

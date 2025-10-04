@@ -10,6 +10,14 @@ function calculateDistanceInBox(currentPosition, targetPosition) {
   return distanceBox;
 }
 
+function calculate3DDistance(currentPosition, targetPosition) {
+  const dx = currentPosition.x - targetPosition.x;
+  const dy = currentPosition.y - targetPosition.y;
+  const dz = currentPosition.z - targetPosition.z;
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+
 function between(x, min, max) {
   return x >= min && x <= max;
 }
@@ -119,4 +127,5 @@ module.exports = {
   getItemEnchantments,
   getRandomInRange,
   placeBlock,
+  calculate3DDistance,
 };
