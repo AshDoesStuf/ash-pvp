@@ -56,6 +56,7 @@ class AshPvP extends EventEmitter {
   #gapEatCount = 0;
 
   #debugEatGap = false;
+  #debugCrystal = true;
 
   /**
    * @type {string}
@@ -497,8 +498,8 @@ class AshPvP extends EventEmitter {
   }
 
   async crystalTick() {
-    if (!this.options.crystalPvP) return; // Crystal PvP must be enabled
-    if (!this.target) return; // No valid target
+    if (!this.options.crystalPvP) return;
+    if (!this.target) return;
 
     const bot = this.#bot;
     const target = this.target;
@@ -507,12 +508,28 @@ class AshPvP extends EventEmitter {
       target.position
     );
 
-    if (distance > this.options.crystalDistance) return; // Target is too far
+    if (distance > this.options.crystalDistance) return;
 
-    // Find the best obsidian position for max damage
+    // Safety check: Don't place crystals if bot is too close to explosion
     const bestPos = this.#findGoodObi();
+    if (bestPos) {
+      const selfDamage = bot.getExplosionDamages(
+        bot.entity,
+        bestPos.offset(0, 1, 0),
+        this.options.crystalDistance,
+        true
+      );
+
+      // Skip if self-damage is too high (more than 6 hearts)
+      if (selfDamage > 12) {
+        console.log(
+          `Skipping crystal: would deal ${selfDamage / 2} hearts to self`
+        );
+        return;
+      }
+    }
+
     if (!bestPos) {
-      // Try placing obsidian
       const placePos = this.#findGoodObsidianPlacement();
       if (placePos && this.#hasObsidian()) {
         await this.#placeObsidian(placePos);
@@ -520,7 +537,6 @@ class AshPvP extends EventEmitter {
       return;
     }
 
-    // Check if an End Crystal already exists at this position
     const existingCrystal = bot.nearestEntity(
       (e) =>
         e.name === "end_crystal" &&
@@ -528,18 +544,183 @@ class AshPvP extends EventEmitter {
     );
 
     if (existingCrystal) {
-      // console.log("yes");
-      // If a crystal exists, check if we should detonate it
       if (this.#shouldDetonate(existingCrystal, target)) {
         this.#detonateCrystal(existingCrystal);
       }
       return;
     }
 
-    // If no crystal exists, place one
     if (this.#hasEndCrystals()) {
       await this.#placeCrystal(bestPos);
     }
+  }
+
+  #findGoodObi() {
+    const target = this.target;
+    const bot = this.#bot;
+
+    if (!target) return null;
+
+    const nearbyObi = bot.findBlocks({
+      matching: (block) =>
+        block.name.includes("obsidian") || block.name.includes("bedrock"),
+      maxDistance: this.options.crystalDistance,
+      point: target.position,
+    });
+
+    const sortedObi = nearbyObi.sort(
+      (a, b) => target.position.distanceTo(a) - target.position.distanceTo(b)
+    );
+
+    if (nearbyObi.length === 0) return null;
+
+    let bestObi = null;
+    let bestScore = -Infinity;
+
+    for (const pos of sortedObi) {
+      const crystalPos = pos.offset(0, 1, 0);
+      const blockAbove1 = bot.blockAt(crystalPos);
+      const blockAbove2 = bot.blockAt(crystalPos.offset(0, 1, 0));
+
+      if (!blockAbove1?.name === "air" || !blockAbove2?.name === "air")
+        continue;
+
+      // skip if there's already a crystal
+      const existingCrystal = bot.nearestEntity(
+        (e) =>
+          e.name === "ender_crystal" && e.position.distanceTo(crystalPos) < 1.5
+      );
+      if (existingCrystal) continue;
+
+      const targetDamage = bot.getExplosionDamages(
+        target,
+        crystalPos,
+        this.options.crystalDistance,
+        true
+      );
+
+      const selfDamage = bot.getExplosionDamages(
+        bot.entity,
+        crystalPos,
+        this.options.crystalDistance,
+        true
+      );
+
+      // Score: prioritize high target damage with low self-damage
+      const score = targetDamage - selfDamage * 1.5;
+
+      // Only consider if target takes at least 6 hearts and self-damage is acceptable
+      if (targetDamage >= 6 && selfDamage < 6 && score > bestScore) {
+        bestScore = score;
+        bestObi = pos;
+      }
+    }
+
+    return bestObi?.floored();
+  }
+
+  #findGoodObsidianPlacement() {
+    const bot = this.#bot;
+    const target = this.target;
+    if (!target) return null;
+
+    const origin = target.position.floored().offset(0, -1, 0);
+    const botPos = bot.entity.position.floored();
+
+    // Expanded offsets - check further out for safer placement
+    const candidateOffsets = [
+      // Distance 1 (risky but high damage)
+      new Vec3(1, 0, 0),
+      new Vec3(-1, 0, 0),
+      new Vec3(0, 0, 1),
+      new Vec3(0, 0, -1),
+
+      // Distance 2 (safer, still effective)
+      new Vec3(2, 0, 0),
+      new Vec3(-2, 0, 0),
+      new Vec3(0, 0, 2),
+      new Vec3(0, 0, -2),
+      new Vec3(2, 0, 1),
+      new Vec3(2, 0, -1),
+      new Vec3(-2, 0, 1),
+      new Vec3(-2, 0, -1),
+      new Vec3(1, 0, 2),
+      new Vec3(-1, 0, 2),
+      new Vec3(1, 0, -2),
+      new Vec3(-1, 0, -2),
+
+      // Diagonals distance ~1.4
+      new Vec3(1, 0, 1),
+      new Vec3(-1, 0, -1),
+      new Vec3(1, 0, -1),
+      new Vec3(-1, 0, 1),
+
+      // Distance 3 (very safe)
+      new Vec3(3, 0, 0),
+      new Vec3(-3, 0, 0),
+      new Vec3(0, 0, 3),
+      new Vec3(0, 0, -3),
+    ];
+
+    let bestPos = null;
+    let bestScore = -Infinity;
+
+    for (const offset of candidateOffsets) {
+      const basePos = origin.plus(offset);
+      const pos = basePos.offset(0, 1, 0); // crystal/obsidian position
+
+      if (!bot.entity.position.distanceTo(pos) < 2.5) continue;
+
+      const blockBelow = bot.blockAt(basePos);
+      const block1Up = bot.blockAt(pos);
+      const block2Up = bot.blockAt(pos.offset(0, 1, 0));
+
+      if (!blockBelow || blockBelow.name === "air") continue;
+      if (!block1Up || block1Up.name !== "air") continue;
+      if (!block2Up || block2Up.name !== "air") continue;
+
+      // skip if there's already a crystal
+      const nearbyCrystal = bot.nearestEntity(
+        (e) => e.name === "ender_crystal" && e.position.distanceTo(pos) < 1.5
+      );
+      if (nearbyCrystal) continue;
+
+      const distanceToBot = botPos.distanceTo(pos);
+      const distanceToTarget = origin.distanceTo(pos);
+
+      if (
+        distanceToBot <= 4.5 && // Within reach
+        distanceToBot >= 2.5
+      ) {
+        // Calculate potential damage to target
+        const targetDamage = bot.getExplosionDamages(
+          target,
+          pos.offset(0, 1, 0),
+          this.options.crystalDistance,
+          true
+        );
+
+        // Calculate potential self-damage
+        const selfDamage = bot.getExplosionDamages(
+          bot.entity,
+          pos.offset(0, 1, 0),
+          this.options.crystalDistance,
+          true
+        );
+
+        const proximityBonus = distanceToTarget <= 2 ? 1.5 : 0.5;
+        const score =
+          targetDamage * proximityBonus - selfDamage * 2 - distanceToBot * 0.3;
+
+        // Only consider if it's actually worth placing
+        if (score > bestScore) {
+          bestScore = score;
+          bestPos = pos;
+        }
+      }
+    }
+
+    return bestPos;
   }
 
   #hasObsidian() {
@@ -560,17 +741,40 @@ class AshPvP extends EventEmitter {
     });
   }
 
-  /**
-   * Checks if an End Crystal should be detonated based on the target's position.
-   */
   #shouldDetonate(crystal, target) {
-    const explosionDamage = this.#bot.getExplosionDamages(
+    const bot = this.#bot;
+
+    // Calculate damage to target
+    const targetDamage = bot.getExplosionDamages(
       target,
       crystal.position,
       this.options.crystalDistance,
       true
     );
-    return explosionDamage >= 6; // Detonate if expected damage is >= 6 hearts
+
+    // Calculate self-damage
+    const selfDamage = bot.getExplosionDamages(
+      bot.entity,
+      crystal.position,
+      this.options.crystalDistance,
+      true
+    );
+
+    // Only detonate if:
+    // 1. Target takes significant damage (at least 6 hearts)
+    // 2. Self-damage is acceptable (less than 4 hearts OR much less than target damage)
+    const worthDetonating =
+      targetDamage >= 6 && (selfDamage < 4 || selfDamage < targetDamage * 0.5);
+
+    if (this.#debugCrystal) {
+      console.log(
+        `Crystal damage - Target: ${targetDamage / 2}♥ | Self: ${
+          selfDamage / 2
+        }♥ | Detonate: ${worthDetonating}`
+      );
+    }
+
+    return worthDetonating;
   }
 
   /**
@@ -899,6 +1103,26 @@ class AshPvP extends EventEmitter {
     const distance = calculateDistanceInBox(botPos, targetPos);
     const targetMoved =
       this.lastTargetPos && this.lastTargetPos.distanceTo(targetPos) > 1.5;
+
+    if (this.options.crystalPvP) {
+      if (distance < 1.5) {
+        // Too close - back away
+        this.#bot.setControlState("back", true);
+        this.#bot.setControlState("forward", false);
+        this.#bot.setControlState("sprint", false);
+      } else if (distance > 4.5) {
+        // Too far - move closer
+        this.#bot.setControlState("forward", true);
+        this.#bot.setControlState("back", false);
+        this.#bot.setControlState("sprint", true);
+      } else {
+        // Good distance - strafe
+        this.#bot.setControlState("forward", false);
+        this.#bot.setControlState("back", false);
+        this.#handleDynamicStrafe(distance);
+      }
+      return;
+    }
 
     // If target moved significantly or we have no path, recalculate
     if (
@@ -1287,108 +1511,6 @@ class AshPvP extends EventEmitter {
     const predicted = predictFuturePosition();
 
     this.#bot.lookAt(predicted.offset(0, 1.1, 0), true);
-  }
-
-  #findGoodObi() {
-    const target = this.target;
-
-    if (!target) return null;
-
-    const nearbyObi = this.#bot
-      .findBlocks({
-        matching: (block) => block.name.includes("obsidian"),
-        maxDistance: this.options.crystalDistance,
-        point: target.position,
-      })
-      .sort((a, b) => {
-        const distA = calculateDistanceInBox(target.position, a, true);
-        const distB = calculateDistanceInBox(target.position, b, true);
-        if (distA !== distB) return distA - distB;
-        return a.y - b.y || a.x - b.x || a.z - b.z;
-      });
-
-    if (nearbyObi.length === 0) return null;
-
-    let bestObi = null;
-    let highestDamage = 0;
-
-    for (const pos of nearbyObi) {
-      const damage = this.#bot.getExplosionDamages(
-        target,
-        pos,
-        this.options.crystalDistance,
-        true
-      );
-
-      if (damage >= 12 && damage > highestDamage) {
-        // 12 HP = 6 hearts
-        highestDamage = damage;
-        bestObi = pos;
-      }
-    }
-
-    return bestObi.floored(); // Returns the best obsidian block for max damage
-  }
-
-  #findGoodObsidianPlacement() {
-    const bot = this.#bot;
-    const target = this.target;
-    if (!target) return null;
-
-    const origin = target.position.floored();
-
-    const candidateOffsets = [
-      new Vec3(1, 0, 0),
-      new Vec3(-1, 0, 0),
-      new Vec3(0, 0, 1),
-      new Vec3(0, 0, -1),
-      new Vec3(1, 0, 1),
-      new Vec3(-1, 0, -1),
-      new Vec3(1, 0, -1),
-      new Vec3(-1, 0, 1),
-      new Vec3(0, -1, 0), // Directly below target (optional)
-    ];
-
-    let bestPos = null;
-    let bestScore = -Infinity;
-
-    for (const offset of candidateOffsets) {
-      const pos = origin.plus(offset);
-
-      const blockBelow = bot.blockAt(pos);
-      const blockAtPos = bot.blockAt(pos.offset(0, 1, 0));
-      const blockAbove = bot.blockAt(pos.offset(0, 2, 0));
-
-      const canPlace =
-        blockBelow &&
-        blockBelow.name !== "air" && // Has something to place on
-        blockAtPos &&
-        blockAtPos.name === "air" &&
-        blockAbove &&
-        blockAbove.name === "air";
-
-      const distance = bot.entity.position.distanceTo(pos);
-
-      if (
-        canPlace &&
-        distance <= 4.5 && // Within reach
-        bot.canSeeBlock(bot.blockAt(pos.offset(0, 1, 0))) // Can see top face
-      ) {
-        const damage = bot.getExplosionDamages(
-          target,
-          pos.offset(0, 1, 0),
-          this.options.crystalDistance,
-          true
-        );
-
-        if (damage > bestScore) {
-          bestScore = damage;
-          bestPos = pos;
-        }
-      }
-    }
-
-    return bestPos; // Where to place obsidian
   }
 
   async placeObstacle() {
