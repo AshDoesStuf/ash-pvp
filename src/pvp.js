@@ -107,7 +107,7 @@ class AshPvP extends EventEmitter {
       /**
        * Crystal pvp
        */
-      crystalPvP: true,
+      crystalPvP: false,
 
       /**
        * Distance we can crystal at
@@ -196,6 +196,25 @@ class AshPvP extends EventEmitter {
     });
 
     this.startUpdateLoop();
+  }
+
+  get hasFullArmor() {
+    const armor = this.#bot.armor();
+
+    const hasAll =
+      armor.head !== null &&
+      armor.torso !== null &&
+      armor.legs !== null &&
+      armor.feet !== null;
+
+    const missing = [];
+
+    if (!armor.head) missing.push("head");
+    if (!armor.torso) missing.push("torso");
+    if (!armor.legs) missing.push("legs");
+    if (!armor.feet) missing.push("feet");
+
+    return { hasAll, missing };
   }
 
   getCurrentSettings() {
@@ -844,7 +863,8 @@ class AshPvP extends EventEmitter {
       if (
         distance <= this.options.maxAttackDist &&
         !this.#eatingGap &&
-        !this.placing
+        !this.placing &&
+        this.shouldPlaceObstacle()
       ) {
         this.canPlaceObstacle = true;
       }
@@ -992,16 +1012,6 @@ class AshPvP extends EventEmitter {
 
     this.#critting = false;
     this.emit("comboHit");
-  }
-
-  // Adaptive dodge to evade incoming attacks
-  #adaptiveDodge() {
-    const dodgeDirection = Math.random() > 0.5 ? "left" : "right";
-    this.#bot.setControlState(dodgeDirection, true);
-
-    setTimeout(() => {
-      this.#bot.setControlState(dodgeDirection, false);
-    }, 1000);
   }
 
   // W-tap technique to reset sprint and increase knockback
@@ -1485,7 +1495,10 @@ class AshPvP extends EventEmitter {
 
     for (const type of armorTypes) {
       const bestArmor = getBestArmor(type);
-      if (bestArmor) await bot.equip(bestArmor, type);
+      if (bestArmor) {
+        await bot.equip(bestArmor, type);
+        await sleep(50);
+      }
     }
   }
 
@@ -1523,7 +1536,7 @@ class AshPvP extends EventEmitter {
     if (!this.target.onGround) return;
 
     // Find obstacle items
-    const itemNames = ["flint_and_steel", "lava_bucket", "cobweb"];
+    const itemNames = ["flint_and_steel", "cobweb"];
     const items = itemNames
       .map((name) =>
         this.#bot.inventory.items().find((i) => i.name.includes(name))
@@ -1532,7 +1545,7 @@ class AshPvP extends EventEmitter {
 
     if (items.length === 0) return;
 
-    // Find the nearest enemy within 3 blocks
+    // Find the target within 3 blocks
     const near =
       calculateDistanceInBox(this.#bot.entity.position, this.target.position) <
       4;
@@ -1572,13 +1585,6 @@ class AshPvP extends EventEmitter {
           await sleep(100);
           this.#bot.activateItem();
         }
-      } else if (randomItem.name.includes("lava_bucket")) {
-        if (isStationary) {
-          await sleep(100);
-          this.#bot.activateItem();
-          await sleep(100);
-          this.#bot.activateItem();
-        }
       } else if (randomItem.name.includes("cobweb")) {
         await placeBlock(this.#bot, "cobweb", placePos);
       }
@@ -1595,6 +1601,18 @@ class AshPvP extends EventEmitter {
       this.placing = false;
       this.resume();
     }
+  }
+
+  shouldPlaceObstacle() {
+    if (!this.target) return false;
+
+    const blockAt = this.#bot.blockAt(this.target.position);
+    const blockBelow = this.#bot.blockAt(blockAt.position.offset(0, -1, 0));
+
+    if (!blockAt) return false;
+    if (blockAt.name === "cobweb") return false;
+
+    return true;
   }
 
   async pearlAway(offestEntity = this.#bot.entity) {
