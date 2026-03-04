@@ -4,4 +4,4 @@ function inject(bot) {
   bot.ashpvp = new AshPvP(bot);
 }
 
-module.exports = inject 
+module.exports = inject;
